@@ -1624,6 +1624,53 @@ async function applyDiff(parameters) {
 }
 
 
+// Opt-in personal-instance operations. Legacy calls never instantiate a ledger.
+function isTrackedOperation(command, parameters) {
+  return command === 'QueryOperation' || command === 'CleanupOperation'
+    || (['WriteFile', 'AppendFile', 'EditFile'].includes(command)
+      && Object.prototype.hasOwnProperty.call(parameters, 'operationId'));
+}
+
+function processTrackedOperation(command, parameters) {
+  try {
+    const { createWriteExecutor } = require('./writeExecutor');
+    const executor = createWriteExecutor({
+      ledgerRoot: path.join(__dirname, '..', '..', 'AppData', 'FileOperatorOperations', 'v1', 'server'),
+      maxBytes: MAX_FILE_SIZE,
+      authorize: target => isPathAllowed(target, 'WriteFile'),
+      preserveAppendEol: true,
+    });
+    let operation;
+    if (command === 'QueryOperation') {
+      operation = executor.query(parameters.operationId);
+    } else if (command === 'CleanupOperation') {
+      if (parameters.confirm !== true && parameters.confirm !== 'true') {
+        throw new Error('CLEANUP_CONFIRM_REQUIRED');
+      }
+      operation = executor.retire(parameters.operationId, parameters.expectedFingerprint);
+    } else {
+      operation = executor.execute({
+        command, filePath: resolveAndNormalizePath(getPathParameter(parameters)),
+        content: parameters.content, encoding: parameters.encoding,
+        operationId: parameters.operationId, expectedRevision: parameters.expectedRevision,
+        conflictPolicy: parameters.conflictPolicy,
+      });
+      if (operation.state !== 'committed') {
+        return { success: false, error: `OPERATION_RECONCILIATION_REQUIRED: ${JSON.stringify(operation)}`,
+          data: { operation } };
+      }
+    }
+    const receipt = operation.receipt || {};
+    return { success: true, data: {
+      message: command === 'QueryOperation' ? '操作记录查询完成'
+        : command === 'CleanupOperation' ? '操作详情已退役清理；目标文件未删除'
+          : operation.replayed ? '已回放历史写入回执；未重复写入' : '文件写入已提交',
+      ...receipt, operation,
+    } };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
 // Batch processing for legacy format with robust content and action aggregation
 async function processBatchRequest(request) {
   debugLog('Processing legacy batch request with robust aggregation', { request });
@@ -1633,6 +1680,7 @@ async function processBatchRequest(request) {
   let i = 1;
   let successCount = 0;
   let failureCount = 0;
+  const operationResults = [];
 
   while (request[`command${i}`]) {
     const command = request[`command${i}`];
@@ -1646,7 +1694,9 @@ async function processBatchRequest(request) {
 
     let result;
     try {
-      switch (command) {
+      if (isTrackedOperation(command, parameters)) {
+        result = processTrackedOperation(command, parameters);
+      } else switch (command) {
         case 'ReadFile':
         case 'WebReadFile':
           const filePath = getPathParameter(parameters, 'filePath') || parameters.url;
@@ -1736,6 +1786,10 @@ async function processBatchRequest(request) {
       result = { success: false, error: error.message };
     }
 
+    if (isTrackedOperation(command, parameters)) {
+      operationResults.push({ index: i, command, success: result.success,
+        ...(result.data || {}), ...(result.error ? { error: result.error } : {}) });
+    }
     if (result.success) {
       successCount++;
       // For non-read operations, generate a summary message instead of pushing to content
@@ -1764,6 +1818,7 @@ async function processBatchRequest(request) {
       data: {
         message: `Batch processing complete. Succeeded: ${successCount}, Failed: ${failureCount}.`,
         content: aggregatedContent,
+        ...(operationResults.length ? { operationResults } : {}),
       },
     };
   }
@@ -1774,6 +1829,7 @@ async function processBatchRequest(request) {
     data: {
       message: `Batch processing complete. Succeeded: ${successCount}, Failed: ${failureCount}.`,
       details: summaryMessages.join('\n'),
+      ...(operationResults.length ? { operationResults } : {}),
     },
   };
 }
@@ -1791,6 +1847,9 @@ async function processRequest(request) {
 
   debugLog('Processing request', { action, parameters });
 
+  if (isTrackedOperation(action, parameters)) {
+    return processTrackedOperation(action, parameters);
+  }
   switch (action) {
     case 'ListAllowedDirectories':
       return await listAllowedDirectories();

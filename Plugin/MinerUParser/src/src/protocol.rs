@@ -198,6 +198,12 @@ pub struct Request {
     /// migrate：实际执行目录改名（默认 false，仅预演）
     #[serde(default, deserialize_with = "de_bool_false")]
     pub apply: bool,
+    /// reindex apply: SHA256 of the exact index bytes returned by preview.
+    #[serde(default, alias = "expectedRevision", deserialize_with = "de_opt_string")]
+    pub expected_revision: Option<String>,
+    /// link_pdf: full PDF fingerprint obtained from the preview.
+    #[serde(default, alias = "expectedPdfSha256", deserialize_with = "de_opt_string")]
+    pub expected_pdf_sha256: Option<String>,
     /// 公开 URL 提交（与 file_path 二选一）
     #[serde(default, deserialize_with = "de_opt_string")]
     pub url: Option<String>,
@@ -219,6 +225,9 @@ pub struct Request {
     /// read 命令：行范围（head:N / tail:N / M-N / M:N / N / all）
     #[serde(default, deserialize_with = "de_opt_string")]
     pub lines: Option<String>,
+    /// read：响应给出的不透明长行续读游标；不可与其他选择器混用。
+    #[serde(default, deserialize_with = "de_opt_string")]
+    pub cursor: Option<String>,
     /// read 命令：相对论文资产目录的 glob（如 images/*.jpg）
     #[serde(default, deserialize_with = "de_opt_string")]
     pub glob: Option<String>,
@@ -257,6 +266,9 @@ pub struct Request {
         deserialize_with = "de_bool_true"
     )]
     pub with_base64: bool,
+    /// Preserve unknown keys for explicit warnings; never echo their values.
+    #[serde(flatten)]
+    pub extra_fields: std::collections::BTreeMap<String, Value>,
 }
 
 fn de_command<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
@@ -538,6 +550,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unknown_parameters_warn_without_leaking_values() {
+        let request: Request = serde_json::from_value(json!({
+            "command": "read", "max_line_length": "secret-not-for-output",
+            "ink": "mark_history", "valet": "Kerr",
+        })).unwrap();
+        let mut payload = SuccessPayload { parts: vec![], data: None };
+        attach_parameter_warnings(&mut payload, &request);
+        let encoded = serde_json::to_string(&payload.data).unwrap();
+        assert!(encoded.contains("max_line_length"));
+        assert!(!encoded.contains("secret-not-for-output"));
+        assert!(!encoded.contains("mark_history"));
+        let clean: Request = serde_json::from_value(json!({
+            "command": "read", "cursor": "opaque", "ink": "mark_history",
+        })).unwrap();
+        let mut payload = SuccessPayload { parts: vec![], data: None };
+        attach_parameter_warnings(&mut payload, &clean);
+        assert!(payload.parts.is_empty());
+        assert!(payload.data.is_none());
+    }
+    #[test]
     fn request_dual_form_deserialization() {
         // 字符串形态
         let r: Request = serde_json::from_str(
@@ -680,6 +712,23 @@ pub struct SuccessPayload {
     pub data: Option<Value>,
 }
 
+/// Surface unsupported input without changing successful command semantics.
+/// Transport metadata is exempt, but command-specific typos remain visible.
+pub fn attach_parameter_warnings(payload: &mut SuccessPayload, request: &Request) {
+    let unknown: Vec<String> = request.extra_fields.keys()
+        .filter(|key| !matches!(key.as_str(),
+            "maid" | "valet" | "tool_name" | "ink" | "archery" | "river" |
+            "timely_contact" | "tool_password"))
+        .map(|key| key.chars().take(80).collect())
+        .collect();
+    if unknown.is_empty() { return; }
+    let warning = format!("UNKNOWN_PARAMETERS: 未支持的参数已忽略：{}。请以工具声明为准。", unknown.join(", "));
+    payload.parts.insert(0, ContentPart::text(warning.clone()));
+    let data = payload.data.get_or_insert_with(|| json!({}));
+    if let Some(object) = data.as_object_mut() {
+        object.insert("parameter_warnings".into(), json!([warning]));
+    }
+}
 pub fn print_payload(payload: SuccessPayload) {
     let mut result = json!({ "content": payload.parts });
     if let Some(d) = payload.data {

@@ -52,6 +52,14 @@
         "description": "功能: 列出此插件被授权访问的所有根目录及其第一层子目录和文件。这是探索可用文件系统的安全入口点。\n参数: 无。\n调用格式:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」ListAllowedDirectories「末」\n<<<[END_TOOL_REQUEST]>>>"
       },
       {
+        "command": "QueryOperation",
+        "description": "查询个人服务端实例的显式写操作记录。参数operationId必需。不执行写入。返回details.operation.record：missing、prepared、committed或retired；committed包含历史receipt，不保证文件当前仍为该版本。prepared表示结果待核对，禁止盲目重试追加；遗留执行锁需人工核查，不自动抢锁。仍校验历史目标写权限。幂等写契约：仅WriteFile/AppendFile/EditFile提供operationId时启用，1-128字符[A-Za-z0-9][A-Za-z0-9._-]*；同ID相同请求回放回执、不同请求报冲突。可选expectedRevision为原文件精确字节SHA256或missing；WriteFile额外可选conflictPolicy=rename（默认）/error/overwrite。新参数只在带operationId时生效；WriteEscapedFile/ApplyDiff等其它命令不支持幂等。省略ID保留原调用行为，不按内容去重。批处理每项用operationId1等后缀，混合旧项重试仍会正常再次执行；details.operationResults返回新操作逐项结果，原批次汇总格式不变。账本不自动过期，位于VCPToolBox/AppData/FileOperatorOperations/v1/server，与客户端独立。AppendFile保持原文件换行风格。新路径采用暂存+原子发布，不承诺ACL/owner/xattr/硬链接与旧直接写等价，不执行旧代码诊断器；不提供对外部写者的全局事务保证。"
+      },
+      {
+        "command": "CleanupOperation",
+        "description": "显式清理一个已提交操作的详细账本，不删除目标文件。参数：operationId、QueryOperation返回的expectedFingerprint=requestFingerprint、confirm=true。先保留retired退役标记，再清理详细记录；旧ID以后返回OPERATION_RETIRED，不再执行。prepared待核对记录禁止清理；无自动过期、不提供清除退役标记接口。cleanupWarnings表示部分清理失败，可核对后显式重试清理。"
+      },
+      {
         "command": "ReadFile",
         "description": "功能: 读取指定绝对路径下文件的内容。特别优化了对多种格式的支持：对于 .pdf, .docx, .xlsx, .xls, .csv 等文件，插件会自动解析并提取其纯文本内容返回给AI；对于其他文件类型，则按普通文本文件读取。支持通过lines参数只返回部分文本行，适合读取大型文本、代码或已提取出的PDF/Word/表格文本。\n参数:\n- filePath (字符串, 必需): 要读取的文件的绝对路径。\n- encoding (字符串, 可选, 默认'utf8'): 对于普通文本文件，可以指定编码格式 (例如: 'utf8', 'ascii')。对于自动解析的文件，此参数无效。\n- lines (字符串或数字, 可选): 只返回指定行范围，行号从1开始，仅对文本内容生效；图片、音频、视频等data URI内容会忽略此参数。支持语法: 'head:N' 读取开头N行，例如 'head:50'；'tail:N' 读取末尾N行，例如 'tail:80'；'M-N' 或 'M:N' 读取第M到N行，例如 '120-180'；'N' 读取单独第N行。\n调用格式:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」ReadFile「末」,\nfilePath:「始」/path/to/your/document.pdf「末」,\nlines:「始」head:50「末」\n<<<[END_TOOL_REQUEST]>>>"
       },

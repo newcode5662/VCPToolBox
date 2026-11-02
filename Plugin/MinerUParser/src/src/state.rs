@@ -111,7 +111,11 @@ pub struct IndexDoc {
     #[serde(default)]
     pub pages: u64,
     pub text_chars: u64,
+    /// Legacy: number of content_list blocks whose type is image.
     pub image_count: usize,
+    /// None on legacy indexes or when the inventory could not be completed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_stats: Option<crate::image_audit::ImageStats>,
     pub table_count: usize,
     pub formula_count: usize,
     pub md_path: String,
@@ -175,7 +179,10 @@ pub fn load_index(file_dir: &Path) -> Option<IndexDoc> {
 }
 
 pub fn save_index(file_dir: &Path, doc: &IndexDoc) -> Result<(), AppError> {
-    atomic_write_json(&index_path(file_dir), doc)
+    let bytes = serde_json::to_vec_pretty(doc)
+        .map_err(|e| AppError::fix(format!("索引序列化失败: {}", e)))?;
+    crate::index_store::commit(&index_path(file_dir), &bytes, None)?;
+    Ok(())
 }
 
 fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), AppError> {
