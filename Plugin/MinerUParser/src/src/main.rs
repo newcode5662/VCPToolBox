@@ -1,13 +1,18 @@
 //! MinerUParser 入口：stdin 解析 → 命令路由 → stdout 单次 JSON 输出。
 
 mod assets;
+mod image_audit;
+mod image_inventory;
+mod index_store;
 mod dedupe;
 mod error;
 mod library;
+mod library_view;
 mod locate;
 mod mineru;
 mod outline;
 mod pdfops;
+mod pdf_binding;
 mod protocol;
 mod quality;
 mod read;
@@ -92,7 +97,10 @@ fn main() {
     };
 
     match result {
-        Ok(payload) => protocol::print_payload(payload),
+        Ok(mut payload) => {
+            protocol::attach_parameter_warnings(&mut payload, &request);
+            protocol::print_payload(payload);
+        }
         Err(err) => {
             let token = env::var("MINERU_TOKEN").unwrap_or_default();
             protocol::print_error(error::sanitize_message(err.message(), &token));
@@ -106,15 +114,19 @@ fn dispatch(request: &Request) -> Result<CommandOutput, AppError> {
         "query" => cmd_query(request),
         "status" => cmd_status(request),
         "list" => cmd_list(request),
+        "library_view" => library_view::command(),
+        "paper_view" => library_view::paper_command(request),
         "info" | "detail" | "paper" => cmd_info(request),
         "batch" => cmd_batch(request),
         "migrate" | "organize" => cmd_migrate(request),
         "locate" => cmd_locate(request),
         "read" => read::cmd_read(request),
+        "reindex" => image_audit::cmd_reindex(request),
+        "link_pdf" | "get_pdf_binding" | "unlink_pdf" => pdf_binding::command(request),
         "preflight" | "precheck" | "dedupe_check" => dedupe::cmd_preflight(request),
         "duplicates" | "dedupe" | "dupes" => dedupe::cmd_duplicates(request),
         other => Err(AppError::fix(format!(
-            "未知命令: {}。支持的命令: parse / query / status / list / info / batch / migrate / locate / read / preflight / duplicates。",
+            "未知命令: {}。支持的命令: parse / query / status / list / info / batch / migrate / locate / read / reindex / preflight / duplicates。",
             other
         ))),
     }
@@ -333,6 +345,7 @@ fn record_json(record: &library::PaperRecord, detail: bool) -> Value {
     });
     if detail {
         if let Some(index) = &record.index {
+            value["image_stats"] = json!(&index.image_stats);
             value["md_path"] = json!(index.md_path.as_str());
             value["render_url"] = json!(index.render_url.as_str());
             value["outline"] = json!(index
@@ -1011,8 +1024,18 @@ fn finalize_in(
     if let Some(warning) = &relocated.warning {
         warnings.push(warning.clone());
     }
+    let image_stats = match image_audit::inspect(
+        &file_dir, &base.join("image").join("mineru").join(&asset_dir),
+    ) {
+        Ok(audit) => Some(audit.image_stats),
+        Err(error) => {
+            warnings.push(format!("图片对账未完成（不解释为0）：{}", error.message()));
+            None
+        }
+    };
     let index = IndexDoc {
         paper_id: paper_id.clone(),
+        image_stats,
         title,
         file_name: file_name.clone(),
         asset_dir: Some(asset_dir.clone()),
@@ -1761,6 +1784,7 @@ fn cmd_info(request: &Request) -> Result<CommandOutput, AppError> {
         ));
         out.push_str(&format!("- **渲染版**：{}\n", index.render_url));
 
+        out.push_str(&image_audit::summary(index.image_stats.as_ref()));
         out.push_str("\n### 目录大纲（前 25 条）\n");
         if index.outline.is_empty() {
             out.push_str("（未识别到标题层级）\n");
@@ -2084,6 +2108,7 @@ fn render_card(index: &IndexDoc, cached: bool) -> String {
         }
     }
 
+    out.push_str(&image_audit::summary(index.image_stats.as_ref()));
     out.push_str("\n### 图片清单\n");
     if index.images.is_empty() {
         out.push_str("（无图片）\n");

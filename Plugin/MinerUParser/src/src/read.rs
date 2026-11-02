@@ -14,6 +14,8 @@ use crate::protocol::{ContentPart, Request};
 use crate::state::{load_index, IndexDoc};
 use crate::zip_safe::list_files;
 use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -135,6 +137,9 @@ fn run_read(
     ctx: &Ctx,
     request: &Request,
 ) -> Result<(Vec<ContentPart>, Option<Value>), AppError> {
+    if let Some(cursor) = request.cursor.as_deref() {
+        return read_line_cursor(ctx, request, cursor);
+    }
     let mut text_specs: Vec<TextSpec> = Vec::new();
     let mut direct_images: Vec<AssetRef> = Vec::new();
 
@@ -303,6 +308,7 @@ fn run_read(
             "hits": hits,
         });
     }
+    truncated = truncated || data_files.iter().any(|file| file["truncated"] == true);
     if !data_files.is_empty() {
         data["files"] = json!(data_files);
     }
@@ -799,7 +805,7 @@ fn read_text_file(rel: &str, abs: &Path) -> Result<String, AppError> {
 }
 
 fn read_text_spec(
-    _ctx: &Ctx,
+    ctx: &Ctx,
     spec: &TextSpec,
     request: &Request,
 ) -> Result<(ContentPart, Value), AppError> {
@@ -812,6 +818,22 @@ fn read_text_spec(
     } else {
         &lines[range.start - 1..range.end]
     };
+    let mut clipped_lines = clipped_line_metadata(body_slice, range.start, MAX_LINE_CHARS);
+    let revision = text_revision(&text);
+    for clipped in &mut clipped_lines {
+        clipped["next_cursor"] = json!(encode_line_cursor(
+            &ctx.paper_id, &spec.asset.rel, &revision,
+            clipped["line"].as_u64().unwrap() as usize, MAX_LINE_CHARS,
+        )?);
+    }
+    let text_truncated = !clipped_lines.is_empty();
+    let mut truncation_reasons = Vec::new();
+    if range.truncated {
+        truncation_reasons.push("LINE_LIMIT");
+    }
+    if text_truncated {
+        truncation_reasons.push("LINE_CHARS_CLIPPED");
+    }
     let body = if body_slice.is_empty() {
         String::new()
     } else if request.show_line {
@@ -838,8 +860,14 @@ fn read_text_spec(
             range.start, range.end, range.total
         ));
     }
-    if range.truncated {
+    if range.truncated || text_truncated {
         header.push_str(" · ⚠️ 已截断");
+    }
+    if text_truncated {
+        header.push_str(&format!(
+            "\n- ⚠️ {} 行存在行内字符截断；行范围已返回不代表这些行内容完整。",
+            clipped_lines.len()
+        ));
     }
     if range.section_hits > 1 {
         header.push_str(&format!(
@@ -866,10 +894,15 @@ fn read_text_spec(
     };
     let data = json!({
         "path": spec.asset.rel,
+        "revision": revision,
         "total_lines": range.total,
         "start": range.start,
         "end": range.end,
-        "truncated": range.truncated,
+        "truncated": range.truncated || text_truncated,
+        "range_truncated": range.truncated,
+        "line_chars_truncated": text_truncated,
+        "truncation_reasons": truncation_reasons,
+        "clipped_lines": clipped_lines,
         "section": range.section_label,
     });
     Ok((ContentPart::text(content), data))
@@ -907,6 +940,108 @@ fn number_lines(
         .join("\n")
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LineCursor {
+    version: u8,
+    paper_id: String,
+    path: String,
+    revision: String,
+    line: usize,
+    char_offset: usize,
+}
+
+fn text_revision(text: &str) -> String {
+    hex::encode(Sha256::digest(text.as_bytes()))
+}
+
+fn encode_line_cursor(
+    paper_id: &str, path: &str, revision: &str, line: usize, char_offset: usize,
+) -> Result<String, AppError> {
+    serde_json::to_string(&LineCursor {
+        version: 1, paper_id: paper_id.into(), path: path.into(),
+        revision: revision.into(), line, char_offset,
+    }).map_err(|e| AppError::fix(format!("游标编码失败: {}", e)))
+}
+
+/// Resume exactly one clipped source line. The cursor is not an authority:
+/// resolve_asset still enforces the asset directory boundary.
+fn read_line_cursor(
+    ctx: &Ctx, request: &Request, raw: &str,
+) -> Result<(Vec<ContentPart>, Option<Value>), AppError> {
+    if raw.len() > 8192 {
+        return Err(AppError::fix("INVALID_CURSOR: 游标过长。"));
+    }
+    if request.path.is_some() || request.paths.is_some() || request.glob.is_some()
+        || request.lines.is_some() || request.section.is_some() || request.find.is_some()
+        || request.images.is_some() || request.page.is_some() || request.caption.is_some()
+    {
+        return Err(AppError::fix("CURSOR_SELECTOR_CONFLICT: cursor 只能与 paper_id、show_line 一起使用。"));
+    }
+    let cursor: LineCursor = serde_json::from_str(raw)
+        .map_err(|_| AppError::fix("INVALID_CURSOR: 无效的长行续读游标。"))?;
+    if cursor.version != 1 || cursor.paper_id != ctx.paper_id || cursor.line == 0 {
+        return Err(AppError::fix("INVALID_CURSOR: 版本、论文或行号不匹配。"));
+    }
+    let asset = resolve_asset(ctx, &cursor.path)?;
+    if asset.is_image {
+        return Err(AppError::fix("INVALID_CURSOR: 游标只支持文本。"));
+    }
+    let text = read_text_file(&asset.rel, &asset.abs)?;
+    let revision = text_revision(&text);
+    if cursor.revision != revision {
+        return Err(AppError::fix("STALE_CURSOR: 文件内容已改变，请重新读取原行。"));
+    }
+    let lines = split_text_lines(&text)?;
+    let line = lines.get(cursor.line - 1)
+        .ok_or_else(|| AppError::fix("INVALID_CURSOR: 行号超出范围。"))?;
+    let total_chars = line.chars().count();
+    if cursor.char_offset >= total_chars {
+        return Err(AppError::fix("INVALID_CURSOR: 字符偏移超出范围。"));
+    }
+    let chunk: String = line.chars().skip(cursor.char_offset).take(MAX_LINE_CHARS).collect();
+    let end = cursor.char_offset + chunk.chars().count();
+    let truncated = end < total_chars;
+    let next_cursor = if truncated {
+        Some(encode_line_cursor(&ctx.paper_id, &asset.rel, &revision, cursor.line, end)?)
+    } else { None };
+    let display = if request.show_line {
+        format!("{} | {}", cursor.line, chunk)
+    } else { chunk.clone() };
+    let part = ContentPart::text(format!(
+        "### `{}` · L{} · 字符 {}-{} / {}（0-based，结束不含）\n\n{}",
+        asset.rel, cursor.line, cursor.char_offset, end, total_chars,
+        fenced(&display, language_of(&asset.rel))
+    ));
+    Ok((vec![part], Some(json!({
+        "paper_id": ctx.paper_id,
+        "truncated": truncated,
+        "files": [{
+            "path": asset.rel, "revision": revision, "start": cursor.line,
+            "end": cursor.line, "char_start": cursor.char_offset, "char_end": end,
+            "total_chars": total_chars, "text": chunk, "truncated": truncated,
+            "next_cursor": next_cursor,
+            "truncation_reasons": if truncated { vec!["LINE_CHARS_CLIPPED"] } else { vec![] },
+        }],
+    }))))
+}
+/// Describe clipping in Unicode scalar offsets, never UTF-8 byte offsets.
+/// Kept separate from display rendering so both numbered and plain reads agree.
+fn clipped_line_metadata(lines: &[String], start: usize, max_chars: usize) -> Vec<Value> {
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let total_chars = line.chars().count();
+            (total_chars > max_chars).then(|| json!({
+                "line": start + index,
+                "total_chars": total_chars,
+                "shown_chars": max_chars,
+                "next_char_offset": max_chars,
+            }))
+        })
+        .collect()
+}
 fn clip_line(line: &str, max_chars: usize) -> String {
     if line.chars().count() <= max_chars {
         line.to_string()
@@ -927,9 +1062,20 @@ fn clip_line_around(line: &str, needle: &str, max_chars: usize) -> String {
     let match_char = if needle_lower.is_empty() {
         None
     } else {
-        line.to_lowercase()
-            .find(&needle_lower)
-            .map(|byte_pos| line[..byte_pos].chars().count())
+        // Lowercasing can expand Unicode (İ → i + combining dot).
+        // Map the folded byte offset back to an original scalar index rather
+        // than slicing the original UTF-8 string with a folded-string offset.
+        line.to_lowercase().find(&needle_lower).and_then(|byte_pos| {
+            let mut folded_bytes = 0;
+            for (index, ch) in line.chars().enumerate() {
+                let width = ch.to_lowercase().map(char::len_utf8).sum::<usize>();
+                if byte_pos < folded_bytes + width {
+                    return Some(index);
+                }
+                folded_bytes += width;
+            }
+            None
+        })
     };
     let start_char = match match_char {
         Some(idx) => idx.saturating_sub(max_chars / 3),
@@ -1148,14 +1294,39 @@ fn run_find(
             FIND_MAX_HITS.saturating_sub(shown),
         );
         total_hits += count;
+        let revision = text_revision(&text);
+        let mut clipped = BTreeMap::new();
+        for hit in &hits {
+            for line_no in hit.context_start..=hit.context_end {
+                let total_chars = lines[line_no - 1].chars().count();
+                if total_chars > MAX_LINE_CHARS && !clipped.contains_key(&line_no) {
+                    clipped.insert(line_no, json!({
+                        "line": line_no,
+                        "total_chars": total_chars,
+                        "excerpt_only": true,
+                        // A focused excerpt may omit both ends: reread from 0.
+                        "next_cursor": encode_line_cursor(
+                            &ctx.paper_id, &spec.asset.rel, &revision, line_no, 0,
+                        )?,
+                    }));
+                }
+            }
+        }
+        let excerpt_truncated = !clipped.is_empty();
         for hit in &hits {
             blocks.push(render_hit_block(&spec.asset.rel, &lines, hit, needle));
             shown += 1;
         }
         files.push(json!({
             "path": spec.asset.rel,
+            "revision": revision,
             "hits": count,
+            "shown_hits": hits.len(),
             "total_lines": range.total,
+            "truncated": range.truncated || count > hits.len() || excerpt_truncated,
+            "line_chars_truncated": excerpt_truncated,
+            "clipped_lines": clipped.into_values().collect::<Vec<_>>(),
+            "hit_limit_reached": count > hits.len(),
         }));
     }
 
@@ -1840,6 +2011,8 @@ mod tests {
             workers: None,
             recursive: true,
             apply: false,
+            expected_revision: None,
+            expected_pdf_sha256: None,
             url: None,
             file_paths: None,
             urls: None,
@@ -1847,6 +2020,7 @@ mod tests {
             path: None,
             paths: None,
             lines: None,
+            cursor: None,
             glob: None,
             find: None,
             section: None,
@@ -1856,6 +2030,7 @@ mod tests {
             context: None,
             show_line: true,
             with_base64: true,
+            extra_fields: BTreeMap::new(),
         }
     }
 
@@ -1949,6 +2124,18 @@ mod tests {
         assert!(!wildcard("fig_?.png", "fig_12.png"));
     }
 
+    #[test]
+    fn clipping_metadata_tracks_unicode_and_exact_boundaries() {
+        let lines = vec!["短行".to_string(), "泉🦀文".to_string(), "abcd".to_string()];
+        let report = clipped_line_metadata(&lines, 10, 2);
+        assert_eq!(report.len(), 2);
+        assert_eq!(report[0]["line"], 11);
+        assert_eq!(report[0]["total_chars"], 3);
+        assert_eq!(report[0]["shown_chars"], 2);
+        assert_eq!(report[1]["line"], 12);
+        assert!(clipped_line_metadata(&[], 0, 2).is_empty());
+        assert!(clipped_line_metadata(&["泉🦀".to_string()], 1, 2).is_empty());
+    }
     #[test]
     fn long_lines_are_clipped() {
         let long = "x".repeat(MAX_LINE_CHARS + 50);
@@ -2046,6 +2233,95 @@ mod tests {
         assert!(select_images(&candidates, &req, &[]).is_err());
     }
 
+    #[test]
+    fn find_long_excerpt_exposes_full_line_cursor() {
+        let base = temp_dir("find_cursor");
+        let ctx = Ctx {
+            paper_id: "paper_test".into(), title: "Find".into(),
+            file_dir: base.clone(), image_dir: base.join("images"), index: None,
+        };
+        let original = format!("{} needle {}", "İ".repeat(1200), "泉".repeat(1200));
+        fs::write(base.join("full.md"), &original).unwrap();
+        let mut req = request();
+        req.find = Some("needle".into());
+        let (_, data) = run_read(&ctx, &req).unwrap();
+        let data = data.unwrap();
+        assert_eq!(data["truncated"], true);
+        assert_eq!(data["files"][0]["shown_hits"], 1);
+        let mut resume = request();
+        resume.cursor = Some(data["files"][0]["clipped_lines"][0]["next_cursor"]
+            .as_str().unwrap().into());
+        let (_, page) = run_read(&ctx, &resume).unwrap();
+        assert_eq!(page.unwrap()["files"][0]["char_start"], 0);
+        assert!(clip_line_around(&original, "needle", 100).contains("needle"));
+        let _ = fs::remove_dir_all(base);
+    }
+    #[test]
+    fn long_line_cursor_roundtrip_and_guards() {
+        let base = temp_dir("cursor");
+        let ctx = Ctx {
+            paper_id: "paper_test".into(), title: "Cursor".into(),
+            file_dir: base.clone(), image_dir: base.join("images"), index: None,
+        };
+        let original = format!("<table>{}</table>", "泉🦀e\u{301}".repeat(900));
+        fs::write(base.join("full.md"), format!("header\n{}\ntail", original)).unwrap();
+        let mut req = request();
+        req.lines = Some("2".into());
+        for show in [true, false] {
+            req.show_line = show;
+            let (_, data) = run_read(&ctx, &req).unwrap();
+            let data = data.unwrap();
+            assert_eq!(data["truncated"], true);
+            assert_eq!(data["files"][0]["line_chars_truncated"], true);
+            let mut cursor = data["files"][0]["clipped_lines"][0]["next_cursor"]
+                .as_str().unwrap().to_string();
+            let first_cursor = cursor.clone();
+            let mut restored: String = original.chars().take(MAX_LINE_CHARS).collect();
+            let mut offset = MAX_LINE_CHARS;
+            loop {
+                let mut resume = request();
+                resume.cursor = Some(cursor);
+                resume.show_line = show;
+                let (_, result) = run_read(&ctx, &resume).unwrap();
+                let result = result.unwrap();
+                let file = &result["files"][0];
+                assert_eq!(file["char_start"], offset);
+                restored.push_str(file["text"].as_str().unwrap());
+                offset = file["char_end"].as_u64().unwrap() as usize;
+                if file["next_cursor"].is_null() {
+                    assert_eq!(result["truncated"], false);
+                    break;
+                }
+                cursor = file["next_cursor"].as_str().unwrap().to_string();
+            }
+            assert_eq!(restored, original);
+            let mut resume = request();
+            resume.cursor = Some(first_cursor.clone());
+            resume.lines = Some("1".into());
+            assert!(run_read(&ctx, &resume).is_err());
+            resume.lines = None;
+            let mut token: Value = serde_json::from_str(&first_cursor).unwrap();
+            for (key, value) in [
+                ("paper_id", json!("paper_other")),
+                ("version", json!(2)), ("line", json!(0)),
+                ("char_offset", json!(999999)), ("path", json!("../outside.md")),
+            ] {
+                let previous = token[key].clone();
+                token[key] = value;
+                resume.cursor = Some(token.to_string());
+                assert!(run_read(&ctx, &resume).is_err(), "must reject {}", key);
+                token[key] = previous;
+            }
+            resume.cursor = Some("malformed".into());
+            assert!(run_read(&ctx, &resume).is_err());
+            // Same line count and byte length must not make a stale cursor valid.
+            fs::write(base.join("full.md"), format!("Header\n{}\ntail", original)).unwrap();
+            resume.cursor = Some(first_cursor);
+            assert!(run_read(&ctx, &resume).unwrap_err().message().contains("STALE_CURSOR"));
+            fs::write(base.join("full.md"), format!("header\n{}\ntail", original)).unwrap();
+        }
+        let _ = fs::remove_dir_all(base);
+    }
     #[test]
     fn run_read_text_and_image_end_to_end() {
         let base = temp_dir("e2e");

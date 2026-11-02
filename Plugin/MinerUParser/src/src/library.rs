@@ -542,6 +542,72 @@ pub fn scan_in(base: &Path, load_index: bool) -> Vec<PaperRecord> {
         .collect()
 }
 
+/// Strict machine view: never confuse an unreadable library with an empty one.
+/// Legacy scan() remains compatible for human-facing command cards.
+pub fn scan_checked(base: &Path) -> Result<Vec<PaperRecord>, AppError> {
+    use std::io::Read;
+    let root = base.join("file").join("mineru");
+    match fs::symlink_metadata(&root) {
+        Ok(meta) if meta.file_type().is_symlink() =>
+            return Err(AppError::fix("LIBRARY_SYMLINK: 库根不能为符号链接。")),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(AppError::fix(format!("LIBRARY_UNREADABLE: {}", e))),
+    }
+    let entries = fs::read_dir(&root)
+        .map_err(|e| AppError::fix(format!("LIBRARY_UNREADABLE: {}", e)))?;
+    let mut out = Vec::new();
+    let mut count = 0;
+    for entry in entries {
+        let entry = entry.map_err(|e| AppError::fix(format!("LIBRARY_ENTRY_UNREADABLE: {}", e)))?;
+        count += 1;
+        if count > 5000 { return Err(AppError::fix("LIBRARY_LIMIT: 超过5000条目录项，未返回截断库。")); }
+        let leaf = entry.file_name().to_string_lossy().into_owned();
+        if leaf.starts_with('.') { continue; }
+        let kind = entry.file_type().map_err(|e| AppError::fix(e.to_string()))?;
+        if kind.is_symlink() { return Err(AppError::fix("LIBRARY_SYMLINK: 资产目录链接需先核查。")); }
+        if !kind.is_dir() { continue; }
+        let dir = entry.path();
+        let mut present = false;
+        for name in ["index.json", "state.json"] {
+            let path = dir.join(name);
+            match fs::symlink_metadata(&path) {
+                Ok(meta) if !meta.is_file() || meta.file_type().is_symlink() =>
+                    return Err(AppError::fix(format!("LIBRARY_INVALID_ASSET: {}不是普通文件", name))),
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(AppError::fix(format!("LIBRARY_UNREADABLE: {}", e))),
+            }
+            present = true;
+            let mut bytes = Vec::new();
+            fs::File::open(&path).map_err(|e| AppError::fix(e.to_string()))?
+                .take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes)
+                .map_err(|e| AppError::fix(e.to_string()))?;
+            if bytes.len() > 16 * 1024 * 1024 {
+                return Err(AppError::fix(format!("LIBRARY_ASSET_TOO_LARGE: {}", path.display())));
+            }
+            let id = if name == "index.json" {
+                serde_json::from_slice::<IndexDoc>(&bytes).map(|v| v.paper_id)
+            } else {
+                serde_json::from_slice::<PersistentState>(&bytes).map(|v| v.paper_id)
+            }.map_err(|e| AppError::fix(format!("LIBRARY_INVALID_JSON: {}: {}", path.display(), e)))?;
+            if !id.starts_with("paper_") || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                || !is_same_paper_dir(&leaf, &id)
+            { return Err(AppError::fix(format!("LIBRARY_ID_MISMATCH: {}", leaf))); }
+        }
+        if present {
+            // Reuse canonical status/title/progress logic. This is not a global
+            // transactional snapshot; concurrent directory replacement may fail.
+            let record = record_from_dir(&dir, true)
+                .ok_or_else(|| AppError::fix("LIBRARY_CHANGED: 扫描中资产变化，请重试。"))?;
+            if record.has_index && record.index.is_none() {
+                return Err(AppError::fix("LIBRARY_CHANGED: 索引读取失败，请重试。"));
+            }
+            out.push(record);
+        }
+    }
+    Ok(out)
+}
 pub fn scan(load_index: bool) -> Vec<PaperRecord> {
     scan_in(&crate::project_base(), load_index)
 }

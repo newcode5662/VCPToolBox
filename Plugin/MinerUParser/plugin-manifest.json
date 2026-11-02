@@ -69,8 +69,38 @@
       },
       {
         "commandIdentifier": "read",
-        "description": "功能: 自由阅读已解析论文。正文：path/paths/glob 选择文件（默认 full.md），lines 指定行范围（head:N、tail:N、M-N、N、all；缺省最多 600 行，lines=all 读全文）；section 按 Markdown 章节标题读取整节（含子节，支持 3.2 或标题关键词）；find 关键词检索并返回命中行与上下文（context 默认 2）。图片：images 按序号（1 起，对应卡片 #N）或 page:N/caption:关键词 选择，也可直接用 page、caption 或 path=images/xxx.jpg；默认 with_base64=true，以 data:image/...;base64 的 image_url content part 返回，多模态模型可直接看图。show_line=false 关闭行号。单次默认最多 20 个文本文件、12 张图片（单图 10MB / 合计 24MB）。\n参数:\n- command (字符串, 必需): 固定为 read\n- paper_id (字符串, 必需): 论文 ID（parse/list/status/info 返回）；也可直接写标题关键词，自动唯一解析\n- path (字符串, 可选): 单文件，默认 full.md；支持 :M-N 后缀；图片路径直接读图\n- paths (数组或分隔字符串, 可选): 多个文件/图片，每项可带 :M-N\n- glob (字符串, 可选): 相对资产目录的通配，如 images/*.jpg、**/*.md\n- lines (字符串, 可选): head:N / tail:N / M-N / M:N / N / all\n- section (字符串, 可选): 章节标题或编号，如 3.2 Experimental Setup、Results\n- find (字符串, 可选): 在正文中检索关键词\n- context (整数, 可选, 默认2): find 命中前后上下文行数（最多10）\n- images (字符串/数组, 可选): 图片选择器，如 3、3,5、page:4、caption:Figure 2、images/xxx.jpg\n- page (整数, 可选): 读取该页全部图片（1 起）\n- caption (字符串, 可选): 按图注关键词选图\n- show_line (布尔值, 可选, 默认true): 文本是否带行号\n- with_base64 (布尔值, 可选, 默认true): 图片是否以 base64 内嵌返回\n说明: 读取结果为 text 与 image_url 两类 content part；图片默认 base64 直接进入模型视觉通道，同时保留 HTTP URL。路径仅限该论文的 file/image 资产目录，拒绝 .. 逃逸。\n调用格式:",
+        "description": "功能: 自由阅读已解析论文。正文：path/paths/glob 选择文件（默认 full.md），lines 指定行范围（head:N、tail:N、M-N、N、all；缺省最多 600 行，lines=all 选择全部行但长行仍按1000字符裁切并返回续读游标）；section 按 Markdown 章节标题读取整节（含子节，支持 3.2 或标题关键词）；find 关键词检索并返回命中行与上下文（context 默认 2）。图片：images 按序号（1 起，对应卡片 #N）或 page:N/caption:关键词 选择，也可直接用 page、caption 或 path=images/xxx.jpg；默认 with_base64=true，以 data:image/...;base64 的 image_url content part 返回，多模态模型可直接看图。show_line=false 关闭行号。单次默认最多 20 个文本文件、12 张图片（单图 10MB / 合计 24MB）。\n参数:\n- command (字符串, 必需): 固定为 read\n- paper_id (字符串, 必需): 论文 ID（parse/list/status/info 返回）；也可直接写标题关键词，自动唯一解析\n- path (字符串, 可选): 单文件，默认 full.md；支持 :M-N 后缀；图片路径直接读图\n- paths (数组或分隔字符串, 可选): 多个文件/图片，每项可带 :M-N\n- glob (字符串, 可选): 相对资产目录的通配，如 images/*.jpg、**/*.md\n- lines (字符串, 可选): head:N / tail:N / M-N / M:N / N / all\n- section (字符串, 可选): 章节标题或编号，如 3.2 Experimental Setup、Results\n- find (字符串, 可选): 在正文中检索关键词\n- context (整数, 可选, 默认2): find 命中前后上下文行数（最多10）\n- images (字符串/数组, 可选): 图片选择器，如 3、3,5、page:4、caption:Figure 2、images/xxx.jpg\n- page (整数, 可选): 读取该页全部图片（1 起）\n- caption (字符串, 可选): 按图注关键词选图\n- cursor (字符串, 可选): 原样传回 files[].clipped_lines[].next_cursor，只与 paper_id、show_line 一起使用；按 Unicode 字符偏移补读一条长行，每页最多1000字符；files[].next_cursor 为 null 时该行完成。文件改变返回 STALE_CURSOR。find 摘录游标从行首重读，不能直接拼接居中摘录。\n- show_line (布尔值, 可选, 默认true): 文本是否带行号\n- with_base64 (布尔值, 可选, 默认true): 图片是否以 base64 内嵌返回\n说明: 读取结果为 text 与 image_url 两类 content part；图片默认 base64 直接进入模型视觉通道，同时保留 HTTP URL。路径仅限该论文的 file/image 资产目录，拒绝 .. 逃逸。\n调用格式:",
         "example": "<<<[TOOL_REQUEST]>>>\ntool_name:「始」MinerUParser「末」,\ncommand:「始」read「末」,\npaper_id:「始」paper_a1b2c3d4e5f60718「末」,\nlines:「始」100-160「末」\n<<<[END_TOOL_REQUEST]>>>\n\n按章节读:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」MinerUParser「末」,\ncommand:「始」read「末」,\npaper_id:「始」paper_a1b2c3d4e5f60718「末」,\nsection:「始」3.2 Experimental Setup「末」\n<<<[END_TOOL_REQUEST]>>>\n\n检索关键词:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」MinerUParser「末」,\ncommand:「始」read「末」,\npaper_id:「始」paper_a1b2c3d4e5f60718「末」,\nfind:「始」microwave absorption「末」,\ncontext:「始」2「末」\n<<<[END_TOOL_REQUEST]>>>\n\n读第 4 页全部图片（base64 直接看图）:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」MinerUParser「末」,\ncommand:「始」read「末」,\npaper_id:「始」paper_a1b2c3d4e5f60718「末」,\npage:「始」4「末」\n<<<[END_TOOL_REQUEST]>>>\n\n按卡片图片序号读图:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」MinerUParser「末」,\ncommand:「始」read「末」,\npaper_id:「始」paper_a1b2c3d4e5f60718「末」,\nimages:「始」3,5「末」\n<<<[END_TOOL_REQUEST]>>>"
+      },
+      {
+        "commandIdentifier": "paper_view",
+        "description": "功能: 工作台完整详情机器元数据，必需精确paper_id。返回schema=mineru.paper-view、schema_version=1、complete=true、truncated=false、revision、规范paper、完整index及state（缺失为null）；保留索引扩展字段，不裁剪大纲和图片数组，不含Markdown正文或PDF字节。元数据总量超过4MB明确报错，不返回部分详情。使用严格全库扫描选择规范资产，坏库可导致查询失败；best_effort_scan不是跨文件事务快照。",
+        "example": "command=paper_view, paper_id=paper_xxx"
+      },
+      {
+        "commandIdentifier": "library_view",
+        "description": "功能: 工作台专用只读机器库元数据，区别于list/info的裁剪卡片。无参数。返回schema=mineru.library-view、schema_version=1、complete=true、truncated=false、total、revision及按paper_id去重的papers；包含状态、统计、进度和duplicate_dirs，不含正文/完整大纲/图片清单/PDF绑定。超过5000目录项或4MB元数据、坏JSON/不匹配ID/不可读资产明确报错，不返回截断全库。consistency=best_effort_scan，非跨文件事务快照。不存在库根返回完整空库。",
+        "example": "command=library_view"
+      },
+      {
+        "commandIdentifier": "reindex",
+        "description": "功能: 只读重索引预演。扫描本地full.md、content_list.json和图片目录，分开返回磁盘图片文件、Markdown内联引用、content_list图块、表格/公式截图路径块及缺失目标数量。保留旧image_count语义，不把图片文件当论文Figure。未知计数为null。默认不修改index/state/正文/图片、不调用云端。预演参数: paper_id/paper_ids或显式all=true，最多200条资产，返回data.items[].index_revision、audit、inventory_preview和逐项失败信息。受控提交: 仅单个paper_id + apply=true + expected_revision（预演index_revision，SHA256），禁止all/paper_ids；索引变化拒绝，生成旧版备份，仅更新images/image_stats/image_provenance/reindexed_at，保留未知字段、旧图片顺序及原始来源，不改state/正文/图片文件。提交回执返回revision、previous_revision、backup、appended；旧修订号重试报冲突，应查询现状而非盲重试。图片目录是路径清单检查，不校验图片二进制内容。重复目录歧义拒绝。",
+        "example": "command=reindex, paper_id=paper_xxx；全库预演用all=true"
+      },
+      {
+        "commandIdentifier": "link_pdf",
+        "description": "功能: 为单篇资产核验本机阅读PDF，独立pdf-binding.json，不覆盖原解析source_path/index/state。必需paper_id、file_path（绝对PDF路径，200MB以内）。默认只读预演返回完整sha256、can_apply、binding_revision；仅PDF内容hash前缀匹配paper_id时允许自动绑定。apply=true提交必须带expected_revision（预演binding_revision，首次missing）及expected_pdf_sha256（预演sha256）；锁内复核文件hash及绑定修订，返回备份和新revision。ID不匹配或URL来源不能据PDF hash认证时拒绝自动提交，需后续人工确认流程；文件头有效不等于PDF版面有效。仅本机路径，非跨设备可移植来源。",
+        "example": "command=link_pdf, paper_id=paper_xxx, file_path=D:\\\\papers\\\\demo.pdf"
+      },
+      {
+        "commandIdentifier": "unlink_pdf",
+        "description": "功能: 禁用单篇资产的本机PDF阅读绑定，不删除PDF，不改原始来源/index/state。默认预演返回binding_revision；apply=true须带expected_revision（首次missing）。写入disabled=true标记，读取端必须禁止回退旧映射或原来源；可通过link_pdf重新绑定。返回备份与新修订号。参数: paper_id、apply?、expected_revision?。",
+        "example": "command=unlink_pdf, paper_id=paper_xxx"
+      },
+      {
+        "commandIdentifier": "get_pdf_binding",
+        "description": "功能: 只读查询指定paper_id的本机PDF阅读绑定及binding_revision；不存在时binding=null、revision=missing。不读取PDF正文，不验证路径当前仍存在或内容仍匹配，不修改文件。参数: paper_id。",
+        "example": "command=get_pdf_binding, paper_id=paper_xxx"
       },
       {
         "commandIdentifier": "preflight",
