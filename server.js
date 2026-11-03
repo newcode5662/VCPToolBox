@@ -889,6 +889,23 @@ app.use((req, res, next) => {
 
 
 
+app.get('/v1/model-capabilities', async (req, res) => {
+    const model = req.query.model;
+    if (typeof model !== 'string' || !model || model.length > 512) {
+        return res.status(400).json({ error: 'model must be a nonempty string (max 512)' });
+    }
+    try {
+        const { modelReasoningService } = require('./modules/modelReasoningService');
+        const resolved = modelRedirectHandler.redirectModelForBackend(model);
+        const { adapter, ...reasoning } = await modelReasoningService.resolve(resolved);
+        res.setHeader('Cache-Control', 'no-store');
+        return res.json({ version: 1, model, reasoning });
+    } catch (error) {
+        console.error('[ModelCapabilities] Capability lookup failed:', error.message);
+        return res.status(503).json({ error: 'Model capabilities unavailable' });
+    }
+});
+
 app.get('/v1/models', async (req, res) => {
     const { default: fetch } = await import('node-fetch');
     const appendSemanticRouterModels = (modelsData) => {
@@ -927,6 +944,8 @@ app.get('/v1/models', async (req, res) => {
             const responseText = await apiResponse.text();
             try {
                 let modelsData = JSON.parse(responseText);
+                const { modelReasoningService } = require('./modules/modelReasoningService');
+                modelReasoningService.seedCatalog(modelsData);
 
                 // 新增：如果启用了模型重定向，需要处理模型列表响应
                 if (modelRedirectHandler.isEnabled()) {

@@ -9,6 +9,7 @@ const path = require('path');
 const http = require('http');
 const https = require('https');
 const finalContextStore = require('./finalContextStore.js');
+const { modelReasoningService } = require('./modelReasoningService');
 
 // 多模态配置真相源（JSON 优先 + 热更新），用于在请求时动态拉取 MultiModalForceTranslateModels
 let multiModalConfigStore = null;
@@ -411,7 +412,7 @@ function applyModelFallbackForAttempt(options, candidates, attemptIndex, debugMo
 async function fetchWithRetry(
   url,
   options,
-  { retries = 3, delay = 1000, debugMode = false, onRetry = null, connectionTimeout = 900000, modelFallbackCandidates = null } = {},
+  { retries = 3, delay = 1000, debugMode = false, onRetry = null, connectionTimeout = 900000, modelFallbackCandidates = null, prepareAttempt = null } = {},
 ) {
   const { default: fetch } = await import('node-fetch');
   const maxAttempts = Math.max(
@@ -446,7 +447,11 @@ async function fetchWithRetry(
     };
 
     try {
-      const attemptOptions = applyModelFallbackForAttempt(options, modelFallbackCandidates, i, debugMode);
+      let attemptOptions = applyModelFallbackForAttempt(options, modelFallbackCandidates, i, debugMode);
+      if (prepareAttempt) attemptOptions = await prepareAttempt(attemptOptions);
+      if (attemptController.signal.aborted) {
+        throw Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' });
+      }
       const response = await fetch(url, {
         ...attemptOptions,
         agent: getFetchAgent, // 注入防御性长连接池
@@ -496,6 +501,7 @@ async function fetchWithRetry(
       return response;
     } catch (error) {
       cleanup();
+      if (error.code === 'INVALID_REASONING_CONFIG') throw error;
 
       // 区分超时中止和外部中止
       if (error.name === 'AbortError') {
@@ -760,6 +766,15 @@ class ChatCompletionHandler {
         : 0;
       console.log(`[VCPChatExtensions] Intercepted and stripped vcpchatExtensions before upstream forwarding. timestampBindings=${bindingCount}`);
     }
+    const reasoningSelection = vcpchatExtensions?.reasoning
+      ? structuredClone(vcpchatExtensions.reasoning) : null;
+    const requestFetchWithRetry = (url, options, retryOptions = {}) => fetchWithRetry(url, options, {
+      ...retryOptions,
+      prepareAttempt: reasoningSelection ? async attempt => ({
+        ...attempt,
+        body: JSON.stringify(await modelReasoningService.adapt(JSON.parse(attempt.body), reasoningSelection))
+      }) : null
+    });
     const requestPreprocessorConfig = vcpchatExtensions
       ? { vcpchatExtensions }
       : {};
@@ -1233,7 +1248,7 @@ class ChatCompletionHandler {
 
       await writeDebugLog('LogOutputAfterProcessing', finalUpstreamBody);
 
-      let firstAiAPIResponse = await fetchWithRetry(
+      let firstAiAPIResponse = await requestFetchWithRetry(
         `${apiUrl}/v1/chat/completions`,
         {
           method: 'POST',
@@ -1358,7 +1373,7 @@ class ChatCompletionHandler {
         clientIp,
         forceShowVCP,
         _refreshRagBlocksIfNeeded,
-        fetchWithRetry,
+        fetchWithRetry: requestFetchWithRetry,
         isToolResultError,
         formatToolResult,
         vcpToolUseForbidden,
@@ -1397,7 +1412,9 @@ class ChatCompletionHandler {
           res.setHeader('Cache-Control', 'no-cache');
           res.setHeader('Connection', 'keep-alive');
 
-          const errorContent = `[ERROR] 代理服务器在连接上游API时失败，可能已达到重试上限或网络错误: ${error.message}`;
+          const errorContent = error.code === 'INVALID_REASONING_CONFIG'
+            ? `[ERROR] 思考配置无效：${error.message}`
+            : `[ERROR] 代理服务器在连接上游API时失败，可能已达到重试上限或网络错误: ${error.message}`;
 
           // Send an error chunk
           const errorPayload = {
@@ -1432,7 +1449,10 @@ class ChatCompletionHandler {
           }
         } else {
           // Non-streaming failure
-          res.status(500).json({ error: 'Internal Server Error', details: error.message });
+          res.status(error.code === 'INVALID_REASONING_CONFIG' ? 400 : 500).json({
+            error: error.code === 'INVALID_REASONING_CONFIG' ? error.code : 'Internal Server Error',
+            details: error.message
+          });
         }
         if (writeChatLog) {
           writeChatLog(originalBody,
@@ -1521,4 +1541,7 @@ Object.defineProperty(ChatCompletionHandler, 'refreshRagBlocksIfNeeded', {
   enumerable: false
 });
 
+Object.defineProperty(ChatCompletionHandler, 'fetchWithRetry', {
+  value: fetchWithRetry, writable: false, configurable: false, enumerable: false
+});
 module.exports = ChatCompletionHandler;
